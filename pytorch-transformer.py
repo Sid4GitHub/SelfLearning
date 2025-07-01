@@ -14,39 +14,39 @@ import os
 from tqdm import tqdm
 import time
 
-# Configuration dictionary - all hyperparameters in one place
+
+# Configuration dictionary - all hyperparameters in one place 
 CONFIG = {
-    'vocab_size': 30000,  # Vocabulary size for both source and target
-    'd_model': 512,  # Model dimension (embedding size)
-    'dff': 2048,  # Feed-forward network dimension
-    'num_heads': 8,  # Number of attention heads
-    'num_encoder_layers': 6,  # Number of encoder layers
-    'num_decoder_layers': 6,  # Number of decoder layers
-    'dropout_rate': 0.1,  # Dropout rate
-    'max_length': 158,  # Maximum sequence length
-    'batch_size': 32,  # Batch size for training
-    'learning_rate': 0.0001,  # Learning rate
-    'epochs': 15,  # Number of training epochs
-    'patience': 3,  # Early stopping patience
-    'max_sentences': 39000,  # Maximum number of sentences to read from CSV
+    'vocab_size': 18000,        # Vocabulary size for both source and target
+    'd_model': 512,             # Model dimension (embedding size)
+    'dff': 2048,                # Feed-forward network dimension
+    'num_heads': 8,             # Number of attention heads
+    'num_encoder_layers': 6,     # Number of encoder layers
+    'num_decoder_layers': 6,     # Number of decoder layers
+    'dropout_rate': 0.1,        # Dropout rate
+    'max_length': 200,          # Maximum sequence length
+    'batch_size': 32,           # Batch size for training
+    'learning_rate': 0.0001,    # Learning rate
+    'epochs': 300,               # Number of training epochs
+    'apply_early_stop': True,
+    'patience': 3,              # Early stopping patience
+    'max_sentences': 39,    # Maximum number of sentences to read from CSV
+    #'device': 'mps' if torch.backends.mps.is_available() else 'cpu'  # Use MPS on Mac M4
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'  # Use GPU if available
-    #,'p_device': torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # Device for PyTorch operations
 }
 
 print(f"Using device: {CONFIG['device']}")
 print(f"Configuration: {CONFIG}")
-
-
+ 
 class Vocabulary:
     """
     Vocabulary class to handle word-to-index and index-to-word mappings
     This is essential for converting text to numbers that the model can process
     """
-
     def __init__(self):
         self.word2idx = {'<PAD>': 0, '<UNK>': 1, '<SOS>': 2, '<EOS>': 3}
         self.idx2word = {0: '<PAD>', 1: '<UNK>', 2: '<SOS>', 3: '<EOS>'}
-        self.word_count = Counter()
+        self.word_count = Counter() #  The Counter object is a specialized dictionary subclass for counting hashable object
 
     def build_vocab(self, sentences, max_vocab_size):
         """Build vocabulary from list of sentences"""
@@ -75,35 +75,39 @@ class Vocabulary:
     def __len__(self):
         return len(self.word2idx)
 
-
 class PositionalEncoding(nn.Module):
     """
     Positional Encoding adds position information to embeddings
     Since transformers don't have inherent position awareness like RNNs,
     we need to explicitly add position information
     """
-
     def __init__(self, d_model, max_length=5000):
         super(PositionalEncoding, self).__init__()
 
         # Create positional encoding matrix
         pe = torch.zeros(max_length, d_model)
-        position = torch.arange(0, max_length, dtype=torch.float).unsqueeze(1)
+        position = torch.arange(0, max_length, dtype=torch.float).unsqueeze(1) #
 
         # Create div_term for sine and cosine functions
+        # We can implement Original paper uses 1 / (10000^(2*i/d_model))
+        # This is equivalent to exp( -(2*i/d_model) * log(10000) )this directly: (a^x=e^(ln(a)))
+        # torch.arange(0, d_model, 2).float()  = [0., 2., 4., ..., dmodel - 1]
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
 
         # Apply sine to even positions and cosine to odd positions
-        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 0::2] = torch.sin(position * div_term) # select all rows, and select columns starting from index 0, going to the end, with a step of 2
         pe[:, 1::2] = torch.cos(position * div_term)
 
         # Add batch dimension and register as buffer (not a parameter)
         pe = pe.unsqueeze(0).transpose(0, 1)
+        # its shape becomes [1, max_length, d_model].
+         #This is done to add a "batch" dimension, even though the positional encoding is typically applied to each item in a batch identically.
+         #The subsequent .transpose(0, 1) then changes the shape to [max_length, 1, d_model].
         self.register_buffer('pe', pe)
 
     def forward(self, x):
         """Add positional encoding to input embeddings"""
-        return x + self.pe[:x.size(0), :]
+        return x + self.pe[:x.size(0), :] # pos_encoding[:seq_len] slices the positional encodings to match the input length
 
 
 class MultiHeadAttention(nn.Module):
@@ -111,7 +115,6 @@ class MultiHeadAttention(nn.Module):
     Multi-Head Attention mechanism - the core of the transformer
     It allows the model to attend to different parts of the sequence simultaneously
     """
-
     def __init__(self, d_model, num_heads):
         super(MultiHeadAttention, self).__init__()
         assert d_model % num_heads == 0
@@ -120,7 +123,7 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.d_k = d_model // num_heads  # Dimension of each head
 
-        # Linear transformations for Q, K, V (without bias as per standard Transformer)
+        # Linear transformations for Q, K, V
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
@@ -131,6 +134,8 @@ class MultiHeadAttention(nn.Module):
         Compute scaled dot-product attention
         Attention(Q,K,V) = softmax(QK^T/√d_k)V
         """
+        # K tensor has a shape of [batch_size, num_heads, sequence_length, d_k]
+        # K.transpose(-2, -1) is swapping the second-to-last dimension (sequence_length) and the last dimension (d_k)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         # Apply mask if provided (for padding or future positions)
@@ -138,6 +143,7 @@ class MultiHeadAttention(nn.Module):
             scores = scores.masked_fill(mask == 0, -1e9)
 
         # Apply softmax
+        #applying softmax along the last dimension means that for each query position, each head and each sequence
         attention_weights = F.softmax(scores, dim=-1)
 
         # Apply attention to values
@@ -148,6 +154,7 @@ class MultiHeadAttention(nn.Module):
         batch_size = query.size(0)
 
         # Linear transformations and split into heads
+        # (batch_size, seq_len, d_model) → (batch_size, seq_len, num_heads, d_k) → (batch_size, num_heads, seq_len, d_k)
         Q = self.W_q(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
         K = self.W_k(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
         V = self.W_v(value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
@@ -156,12 +163,17 @@ class MultiHeadAttention(nn.Module):
         attention_output, attention_weights = self.scaled_dot_product_attention(Q, K, V, mask)
 
         # Concatenate heads
+        # (batch_size, num_heads, seq_len, d_k) → (batch_size, seq_len, num_heads, d_k) → (batch_size, seq_len, d_model)
         attention_output = attention_output.transpose(1, 2).contiguous().view(
             batch_size, -1, self.d_model)
 
         # Final linear transformation
         output = self.W_o(attention_output)
         return output
+
+# Linear weights (W_q, W_k, W_v, W_o) are [d_model, d_model],
+# while Q, K, and V before attention are [batch_size, num_heads, sequence_length, d_k],
+# the final output is [batch_size, sequence_length, d_model]
 
 
 class FeedForwardNetwork(nn.Module):
@@ -170,7 +182,6 @@ class FeedForwardNetwork(nn.Module):
     Two linear transformations with ReLU activation in between
     FFN(x) = max(0, xW1 + b1)W2 + b2
     """
-
     def __init__(self, d_model, dff):
         super(FeedForwardNetwork, self).__init__()
         self.linear1 = nn.Linear(d_model, dff)
@@ -189,7 +200,6 @@ class EncoderLayer(nn.Module):
     3. Feed-forward network
     4. Residual connection + Layer normalization
     """
-
     def __init__(self, d_model, num_heads, dff, dropout_rate):
         super(EncoderLayer, self).__init__()
         self.mha = MultiHeadAttention(d_model, num_heads)
@@ -213,6 +223,41 @@ class EncoderLayer(nn.Module):
         return out2
 
 
+
+class Encoder(nn.Module):
+    """
+    Complete Encoder consisting of:
+    1. Input embedding
+    2. Positional encoding
+    3. Stack of encoder layers
+    """
+    def __init__(self, vocab_size, d_model, num_layers, num_heads, dff, max_length, dropout_rate):
+        super(Encoder, self).__init__()
+        self.d_model = d_model
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoding = PositionalEncoding(d_model, max_length)
+        self.enc_layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, dff, dropout_rate)
+            for _ in range(num_layers)
+        ])
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x, mask=None):
+        seq_len = x.size(1)
+
+        # Embedding + positional encoding
+        x = self.embedding(x) * math.sqrt(self.d_model)  # Scale embeddings
+        x = self.pos_encoding(x.transpose(0, 1)).transpose(0, 1)
+        x = self.dropout(x)
+
+        # Pass through encoder layers
+        for enc_layer in self.enc_layers:
+            x = enc_layer(x, mask)
+
+        return x
+    
+
+
 class DecoderLayer(nn.Module):
     """
     Single Decoder Layer containing:
@@ -223,7 +268,6 @@ class DecoderLayer(nn.Module):
     5. Feed-forward network
     6. Residual connection + Layer normalization
     """
-
     def __init__(self, d_model, num_heads, dff, dropout_rate):
         super(DecoderLayer, self).__init__()
         self.mha1 = MultiHeadAttention(d_model, num_heads)  # Self-attention
@@ -253,42 +297,7 @@ class DecoderLayer(nn.Module):
         out3 = self.layernorm3(out2 + ffn_output)
 
         return out3
-
-
-class Encoder(nn.Module):
-    """
-    Complete Encoder consisting of:
-    1. Input embedding
-    2. Positional encoding
-    3. Stack of encoder layers
-    """
-
-    def __init__(self, vocab_size, d_model, num_layers, num_heads, dff, max_length, dropout_rate):
-        super(Encoder, self).__init__()
-        self.d_model = d_model
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, max_length)
-        self.enc_layers = nn.ModuleList([
-            EncoderLayer(d_model, num_heads, dff, dropout_rate)
-            for _ in range(num_layers)
-        ])
-        self.dropout = nn.Dropout(dropout_rate)
-
-    def forward(self, x, mask=None):
-        seq_len = x.size(1)
-
-        # Embedding + positional encoding
-        x = self.embedding(x) * math.sqrt(self.d_model)  # Scale embeddings
-        x = self.pos_encoding(x.transpose(0, 1)).transpose(0, 1)
-        x = self.dropout(x)
-
-        # Pass through encoder layers
-        for enc_layer in self.enc_layers:
-            x = enc_layer(x, mask)
-
-        return x
-
-
+    
 class Decoder(nn.Module):
     """
     Complete Decoder consisting of:
@@ -296,7 +305,6 @@ class Decoder(nn.Module):
     2. Positional encoding
     3. Stack of decoder layers
     """
-
     def __init__(self, vocab_size, d_model, num_layers, num_heads, dff, max_length, dropout_rate):
         super(Decoder, self).__init__()
         self.d_model = d_model
@@ -328,17 +336,15 @@ class Transformer(nn.Module):
     Complete Transformer model for sequence-to-sequence translation
     Combines encoder and decoder with final linear layer for vocabulary prediction
     """
-
     def __init__(self, src_vocab_size, tgt_vocab_size, d_model, num_layers, num_heads,
                  dff, max_length, dropout_rate):
         super(Transformer, self).__init__()
 
         self.encoder = Encoder(src_vocab_size, d_model, num_layers, num_heads,
-                               dff, max_length, dropout_rate)
+                              dff, max_length, dropout_rate)
         self.decoder = Decoder(tgt_vocab_size, d_model, num_layers, num_heads,
-                               dff, max_length, dropout_rate)
+                              dff, max_length, dropout_rate)
         self.final_layer = nn.Linear(d_model, tgt_vocab_size)
-        #self.device = CONFIG['p_device']
         self.device = torch.device(CONFIG['device'])
 
     def create_padding_mask(self, seq):
@@ -354,13 +360,28 @@ class Transformer(nn.Module):
         # Create masks
         src_mask = self.create_padding_mask(src)
 
+        """
         if training:
             tgt_seq_len = tgt.size(1)
             look_ahead_mask = self.create_look_ahead_mask(tgt_seq_len).to(self.device)
             tgt_padding_mask = self.create_padding_mask(tgt).to(self.device)
             combined_mask = torch.max(look_ahead_mask, ~tgt_padding_mask)
         else:
-            combined_mask = None
+            #combined_mask = None
+            tgt_seq_len = tgt.size(1)
+            look_ahead_mask = self.create_look_ahead_mask(tgt_seq_len).to(self.device)
+            combined_mask = look_ahead_mask
+        """
+
+        # Create target padding mask
+        tgt_padding_mask = self.create_padding_mask(tgt).to(self.device)
+
+        # Create look-ahead mask for target sequence
+        tgt_seq_len = tgt.size(1)
+        look_ahead_mask = self.create_look_ahead_mask(tgt_seq_len).to(self.device)
+
+        # Combine look-ahead and padding masks for decoder self-attention
+        combined_mask = torch.logical_and(look_ahead_mask, tgt_padding_mask)
 
         # Encoder
         enc_output = self.encoder(src, src_mask)
@@ -379,7 +400,6 @@ class TranslationDataset(Dataset):
     Custom Dataset class for handling translation data
     Efficiently loads and processes data in batches
     """
-
     def __init__(self, src_sentences, tgt_sentences, src_vocab, tgt_vocab, max_length):
         self.src_sentences = src_sentences
         self.tgt_sentences = tgt_sentences
@@ -396,22 +416,29 @@ class TranslationDataset(Dataset):
 
         # Encode sentences
         src_encoded = self.src_vocab.encode(src_sentence)
-        tgt_encoded = [self.tgt_vocab.word2idx['<SOS>']] + self.tgt_vocab.encode(tgt_sentence) + [
-            self.tgt_vocab.word2idx['<EOS>']]
+        #tgt_encoded = [self.tgt_vocab.word2idx['<SOS>']] + self.tgt_vocab.encode(tgt_sentence) + [self.tgt_vocab.word2idx['<EOS>']]
+        tgt_encoded_ip = [self.tgt_vocab.word2idx['<SOS>']] + self.tgt_vocab.encode(tgt_sentence)
+        tgt_encoded_op = self.tgt_vocab.encode(tgt_sentence) + [self.tgt_vocab.word2idx['<EOS>']]
+
 
         # Truncate if too long
         if len(src_encoded) > self.max_length:
             src_encoded = src_encoded[:self.max_length]
-        if len(tgt_encoded) > self.max_length:
-            tgt_encoded = tgt_encoded[:self.max_length]
+        if len(tgt_encoded_ip) > self.max_length:
+            tgt_encoded_ip = tgt_encoded_ip[:self.max_length]
+        if len(tgt_encoded_op) > self.max_length:
+            tgt_encoded_op = tgt_encoded_op[:self.max_length]
+
 
         # Pad sequences
         src_padded = src_encoded + [0] * (self.max_length - len(src_encoded))
-        tgt_padded = tgt_encoded + [0] * (self.max_length - len(tgt_encoded))
+        tgt_encoded_ip = tgt_encoded_ip + [0] * (self.max_length - len(tgt_encoded_ip))
+        tgt_encoded_op = tgt_encoded_op + [0] * (self.max_length - len(tgt_encoded_op))
 
         return {
             'src': torch.tensor(src_padded, dtype=torch.long),
-            'tgt': torch.tensor(tgt_padded, dtype=torch.long)
+            'tgt_ip': torch.tensor(tgt_encoded_ip, dtype=torch.long),
+            'tgt_op': torch.tensor(tgt_encoded_op, dtype=torch.long)
         }
 
 
@@ -456,8 +483,9 @@ def load_data_efficiently(file_name, max_sentences):
         return [], []
 
     print(f"Successfully loaded {len(english_sentences)} sentence pairs")
+    #print(f"English sentences: {english_sentences[:5]}")
+    #print(f"Bengali sentences: {bengali_sentences[:5]}")
     return english_sentences, bengali_sentences
-
 
 def create_data_loaders(english_sentences, bengali_sentences, src_vocab, tgt_vocab, config):
     """Create train and validation data loaders"""
@@ -488,7 +516,6 @@ class EarlyStopping:
     Early stopping to prevent overfitting
     Stops training when validation loss stops improving
     """
-
     def __init__(self, patience=5, min_delta=0.001):
         self.patience = patience
         self.min_delta = min_delta
@@ -504,14 +531,11 @@ class EarlyStopping:
 
         return self.counter >= self.patience
 
-
 def train_model(model, train_loader, val_loader, config):
     """
     Train the transformer model with early stopping
     """
-    device = torch.device(CONFIG['device'])
-    #device = config['p_device']
-
+    device = torch.device(config['device'])
     model = model.to(device)
 
     # Loss function and optimizer
@@ -525,28 +549,42 @@ def train_model(model, train_loader, val_loader, config):
     train_losses = []
     val_losses = []
 
+    start_time = time.time()
     print("Starting training...")
-
     for epoch in range(config['epochs']):
+
+        time_elapse = time.time() - start_time
+        print(f"Time elapsed: {time_elapse // 60:.0f}m {time_elapse % 60:.0f}s")
+
+        if time_elapse > 1 * (60 * 60):
+            print("Time limit exceeded. Stopping training.")
+            break
+
+
         model.train()
         epoch_train_loss = 0
 
         # Training loop
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}")):
             src = batch['src'].to(device)
-            tgt = batch['tgt'].to(device)
+            tgt_ip = batch['tgt_ip'].to(device)
+            tgt_op = batch['tgt_op'].to(device)
 
-            # Prepare input and target
-            tgt_input = tgt[:, :-1]  # Remove last token for input
-            tgt_real = tgt[:, 1:]  # Remove first token for target
+            #print("\nsrc:", src)
+            #print("tgt_input:", tgt_ip)
+            #print("tgt_real:", tgt_op)
 
             optimizer.zero_grad()
 
             # Forward pass
-            predictions = model(src, tgt_input, training=True)
+            predictions = model(src, tgt_ip, training=True)
+
+            #print("\npredictions:", predictions)
+
+            #print("")
 
             # Calculate loss
-            loss = criterion(predictions.reshape(-1, predictions.size(-1)), tgt_real.reshape(-1))
+            loss = criterion(predictions.reshape(-1, predictions.size(-1)), tgt_op.reshape(-1))
 
             # Backward pass
             loss.backward()
@@ -560,14 +598,16 @@ def train_model(model, train_loader, val_loader, config):
         with torch.no_grad():
             for batch in val_loader:
                 src = batch['src'].to(device)
-                tgt = batch['tgt'].to(device)
 
-                tgt_input = tgt[:, :-1]
-                tgt_real = tgt[:, 1:]
+                tgt_ip = batch['tgt_ip'].to(device)
+                tgt_op = batch['tgt_op'].to(device)
 
-                predictions = model(src, tgt_input, training=True)
-                loss = criterion(predictions.reshape(-1, predictions.size(-1)), tgt_real.reshape(-1))
+                predictions = model(src, tgt_ip, training=True)
+                loss = criterion(predictions.reshape(-1, predictions.size(-1)), tgt_op.reshape(-1))
                 epoch_val_loss += loss.item()
+
+        #print("len(train_loader): ", len(train_loader))
+        #print("len(val_loader):", len(val_loader))
 
         # Average losses
         avg_train_loss = epoch_train_loss / len(train_loader)
@@ -576,13 +616,14 @@ def train_model(model, train_loader, val_loader, config):
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
 
-        print(f"Epoch {epoch + 1}/{config['epochs']}")
+        print(f"Epoch {epoch+1}/{config['epochs']}")
         print(f"Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
 
-        # Early stopping check
-        if early_stopping(avg_val_loss):
-            print(f"Early stopping triggered at epoch {epoch + 1}")
-            break
+        if config['apply_early_stop'] :
+          # Early stopping check
+          if early_stopping(avg_val_loss):
+              print(f"Early stopping triggered at epoch {epoch+1}")
+              break
 
     # Plot training history
     plt.figure(figsize=(10, 6))
@@ -602,14 +643,12 @@ class TranslationInference:
     """
     Inference class for translating sentences using trained model
     """
-
     def __init__(self, model, src_vocab, tgt_vocab, config):
         self.model = model
         self.src_vocab = src_vocab
         self.tgt_vocab = tgt_vocab
         self.config = config
-        self.device = torch.device(CONFIG['device']) 
-        #self.device = config['p_device']
+        self.device = torch.device(config['device'])
         self.model.eval()
 
     def translate(self, sentence, max_length=None):
@@ -641,7 +680,7 @@ class TranslationInference:
                 predictions = self.model(src_tensor, tgt_tensor, training=False)
 
                 # Get next token prediction
-                next_token_logits = predictions[0, len(tgt_input) - 1, :]
+                next_token_logits = predictions[0, len(tgt_input)-1, :]
                 next_token = torch.argmax(next_token_logits).item()
 
                 # Add to target input
@@ -683,6 +722,13 @@ def main():
 
     print(f"Source vocabulary size: {len(src_vocab)}")
     print(f"Target vocabulary size: {len(tgt_vocab)}")
+
+    #print(f"Source vocabulary : {src_vocab.idx2word}")
+    #print(f"Target vocabulary: {tgt_vocab.idx2word}")
+
+    #print("english_sentences:", english_sentences)
+    #print("bengali_sentences", bengali_sentences)
+    
 
     # Create data loaders
     train_loader, val_loader = create_data_loaders(
@@ -727,7 +773,8 @@ def main():
     # Test translations
     print("\n=== Testing Translations ===")
     test_sentences = [
-        "Hello, how are you?",
+        "a dog running"
+        ,"Hello, how are you?",
         "I love you.",
         "What is your name?",
         "Good morning.",
